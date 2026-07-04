@@ -102,27 +102,29 @@ async function startBot() {
     });
 
     sock.ev.on('connection.update', async (update) => {
-        // Safety fallback: Handle fresh, empty session initialization
-        if (!update || Object.keys(update).length === 0) {
-            console.log('⚙️ [Session Init] Fresh session detected. Awaiting pairing code...');
-            return;
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            console.log("📄 QR Code generated! Scan it or make sure pairing mode is active.");
         }
 
-        const { connection, lastDisconnect } = update;
-        
         if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            const errorMsg = lastDisconnect?.error?.toString() || "";
-            console.log(`🔌 Connection severed. Reason code: ${reason}`);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            console.log(`🔌 Connection severed. Reason code: ${statusCode}`);
 
-            // TARGET SPECIFIC DUPLICATE CONFLICT TERMINATIONS
-            if (errorMsg.toLowerCase().includes('conflict') || reason === DisconnectReason.loggedOut) {
-                console.log('🚨 CRITICAL CONFLICT: Multiple instances or logouts detected. Purging duplicate states and forcing exit...');
-                if (fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
-                process.exit(1); // Kill the container instantly
-            } else {
+            // FIX: Force reconnection even if code is 405/loggedOut when database is completely empty
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            
+            // If it's a 405, but we deliberately have an empty session ID / no session in DB, DO NOT drop out.
+            if (isLoggedOut && !process.env.SESSION_ID) {
+                console.log("🆕 Fresh start environment detected. Forcing setup routine...");
+                setTimeout(() => startBot(), 5000); // Wait 5 seconds and retry safely
+            } else if (!isLoggedOut) {
+                // Standard crash reconnection handler
                 console.log('🔄 Attemping standard reconnection...');
                 setTimeout(() => startBot(), 5000);
+            } else {
+                console.log("❌ Device explicitly unlinked by user. Stopped.");
             }
         } else if (connection === 'open') {
             console.log('🚀 ADEZ-MD IS OPERATIONAL AND ONLINE!');
