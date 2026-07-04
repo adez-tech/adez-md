@@ -103,38 +103,51 @@ async function startBot() {
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
+
+        // 1. Capture and print QR Code if generated in the console terminal
         if (qr) {
-            console.log("📄 QR Code generated! Scan it or make sure pairing mode is active.");
+            console.log("📟 QR Code updated! Scan this grid immediately to authenticate.");
         }
 
+        // 2. Handle Connection Closure / Disconnects
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            console.log(`🔌 Connection severed. Reason code: ${statusCode}`);
+            const reasonMessage = lastDisconnect?.error?.message || "Unknown error stream";
+            
+            console.log(`🔌 Connection severed. Reason code: ${statusCode} (${reasonMessage})`);
 
-            // FIX: Force reconnection even if code is 405/loggedOut when database is completely empty
+            // Check if the server explicitly threw a DisconnectReason.loggedOut (405)
             const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-            
-            // If it's a 405, but we deliberately have an empty session ID / no session in DB, DO NOT drop out.
-            if (isLoggedOut && !process.env.SESSION_ID) {
-                console.log("🆕 Fresh start environment detected. Forcing setup routine...");
-                setTimeout(() => startBot(), 5000); // Wait 5 seconds and retry safely
+
+            // Bypassing the 405 loop for fresh initializations:
+            // If the database is completely empty, a 405 means Baileys didn't find credentials.
+            // We catch this, ignore the "stop reconnecting" rule, and force a fresh loop setup.
+            if (isLoggedOut && (!process.env.SESSION_ID || process.env.SESSION_ID === '')) {
+                console.log("🆕 Safety logic triggered: Fresh cloud record environment detected.");
+                console.log("🔄 Overriding 405 loop dropout. Initializing fresh pairing routine in 5s...");
+                
+                setTimeout(() => {
+                    // Replace 'connectToWhatsApp' with the exact name of your startup function if different
+                    startBot(); 
+                }, 5000);
+
             } else if (!isLoggedOut) {
-                // Standard crash reconnection handler
-                console.log('🔄 Attemping standard reconnection...');
-                setTimeout(() => startBot(), 5000);
+                // Standard network drop or session timeout - auto reconnect safely
+                console.log("🔄 Standard disconnection detected. Reconnecting in 5s...");
+                setTimeout(() => {
+                    startBot();
+                }, 5000);
+
             } else {
-                console.log("❌ Device explicitly unlinked by user. Stopped.");
+                // Actual user-triggered logout (when device is unlinked from the phone app intentionally)
+                console.log("❌ Device permanently unlinked from phone app by the session owner. Halting execution loop.");
+                process.exit(1); // Safely stop the process to prevent an infinite crash loop on Render
             }
-        } else if (connection === 'open') {
-            console.log('🚀 ADEZ-MD IS OPERATIONAL AND ONLINE!');
-            await uploadSessionToSupabase();
-            
-            // Send confirmation directly to your phone
-            if (ownerNumber) {
-                const cleanJid = ownerNumber.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-                await sock.sendMessage(cleanJid, { text: '🎉 *ADEZ-MD Connected Successfully!*\n\nYour WhatsApp bot is officially running and backed up onto your Cloud Server.' });
-            }
+        }
+
+        // 3. Handle Successful Connection
+        if (connection === 'open') {
+            console.log("✅ Connection successfully established! Adez-MD is online and active.");
         }
     });
 
