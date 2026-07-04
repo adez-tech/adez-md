@@ -101,7 +101,7 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: !process.env.PAIRING_NUMBER,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "22.0.0"]
+        browser: ["Mac OS", "Chrome", "123.0.0.0"]
     });
 
     sock._pairingCodeSent = false;
