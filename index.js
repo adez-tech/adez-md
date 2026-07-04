@@ -102,6 +102,12 @@ async function startBot() {
     });
 
     sock.ev.on('connection.update', async (update) => {
+        // Safety fallback: Handle fresh, empty session initialization
+        if (!update || Object.keys(update).length === 0) {
+            console.log('⚙️ [Session Init] Fresh session detected. Awaiting pairing code...');
+            return;
+        }
+
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
