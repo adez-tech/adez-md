@@ -21,6 +21,7 @@ const sessionFolder = './session';
 
 let lastBackupTime = 0;
 const BACKUP_THROTTLE_MS = 2 * 60 * 1000; // Force maximum once per 2 minutes safeguard
+let sessionExists = false; // Track if a session was found
 
 // 1. DATABASE BACKUP LOGIC (Supabase Cloud Sync)
 async function uploadSessionToSupabase() {
@@ -59,6 +60,7 @@ async function downloadSessionFromSupabase() {
         if (error) throw error;
         if (data && data.data) {
             console.log('📦 Found matching cloud credentials. Restoring local session states...');
+            sessionExists = true;
             if (fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
             fs.mkdirSync(sessionFolder, { recursive: true });
 
@@ -68,9 +70,15 @@ async function downloadSessionFromSupabase() {
             console.log('✅ Local session files completely synchronized.');
         } else {
             console.log('🆕 No prior cloud records detected. Fresh credentials required.');
+            sessionExists = false;
+            // Notify connected clients that pairing is required
+            if (io) {
+                io.emit('session_status', { exists: false, message: 'No session found. Please scan the pairing code.' });
+            }
         }
     } catch (err) {
         console.log('❌ [Session Download Failed]:', err.message);
+        sessionExists = false;
     }
 }
 
@@ -148,12 +156,27 @@ async function startBot() {
         // 3. Handle Successful Connection
         if (connection === 'open') {
             console.log("✅ Connection successfully established! Adez-MD is online and active.");
+            sessionExists = true;
+            // Notify clients that bot is ready
+            if (io) {
+                io.emit('session_status', { exists: true, message: 'Bot is now online.' });
+            }
         }
     });
 
     // 3. INTERNAL ROUTER FOR THE PAIRING SCREEN (SOCKET.IO)
     io.removeAllListeners('connection');
     io.on('connection', (socket) => {
+        // Immediately tell the client if a session exists
+        socket.emit('session_check', { exists: sessionExists });
+        
+        // If no session exists, prompt for pairing code
+        if (!sessionExists) {
+            socket.emit('pairing_required', {
+                message: 'No existing session found. Please provide your phone number to generate a pairing code.'
+            });
+        }
+
         socket.on('request_code', async (num) => {
             try {
                 const formattedNum = num.replace(/[^0-9]/g, '');
@@ -162,8 +185,10 @@ async function startBot() {
                 let code = await sock.requestPairingCode(formattedNum);
                 code = code?.match(/.{1,4}/g)?.join('-') || code; // Break it down into readable ABCD-EFGH format
                 
+                console.log(`✅ Pairing code generated: ${code}`);
                 socket.emit('pairing_code', code);
             } catch (err) {
+                console.log(`❌ Pairing code error: ${err.message}`);
                 socket.emit('pairing_error', 'Failed to retrieve code. Check if the server is already linked.');
             }
         });
