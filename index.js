@@ -100,9 +100,9 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: !process.env.PAIRING_NUMBER,
         auth: state,
         browser: ["Mac OS", "Chrome", "123.0.0.0"]
+        // Make sure printQRInTerminal: true is completely removed here
     });
 
     sock._pairingCodeSent = false;
