@@ -101,7 +101,8 @@ async function connectToWhatsApp() {
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
         auth: state,
-        browser: ["Mac OS", "Chrome", "123.0.0.0"]
+        // Disguise the bot completely as a regular desktop Mac/Chrome user
+        browser: ['Mac OS', 'Chrome', '124.0.0.0']
         // Make sure printQRInTerminal: true is completely removed here
     });
 
