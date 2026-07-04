@@ -1,8 +1,12 @@
-import makeWASocket, { 
-    useMultiFileAuthState, 
-    DisconnectReason 
-} from '@whiskeysockets/baileys';
+import * as baileysRaw from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
+
+// Normalize module shape so this file works with both default and named/ESM exports
+const baileys = (baileysRaw && baileysRaw.default) ? baileysRaw.default : baileysRaw;
+const makeWASocket = baileys.makeWASocket || baileys;
+const useMultiFileAuthState = baileys.useMultiFileAuthState || baileysRaw.useMultiFileAuthState;
+const DisconnectReason = baileys.DisconnectReason || baileysRaw.DisconnectReason;
+
 import pino from 'pino';
 import express from 'express';
 import { createServer } from 'http';
