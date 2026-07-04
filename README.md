@@ -461,7 +461,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ### Join Our Community
 
-- 🌐 **Website:** [@adeztech)
+- 🌐 **Website:** [@adeztech](https://social-media-booster--efrinearnold200.replit.app/)
 - 🐙 **GitHub:** [@adez-tech](https://github.com/adez-tech)
 - 🔗 **Social:** Follow for updates and announcements
 
