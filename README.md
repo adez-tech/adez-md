@@ -1,4 +1,3 @@
-````markdown
 # 🤖 ADEZ-MD BOT
 
 A powerful, feature-rich WhatsApp bot built with Node.js and Baileys, offering an extensive command system with 24+ categories and 100+ commands.
@@ -462,7 +461,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ### Join Our Community
 
-- 🌐 **Website:** [keithsite.com](https://keithsite.com)
+- 🌐 **Website:** [@adeztech)
 - 🐙 **GitHub:** [@adez-tech](https://github.com/adez-tech)
 - 🔗 **Social:** Follow for updates and announcements
 
@@ -536,4 +535,3 @@ If you found this project helpful, please give it a **⭐ Star** on GitHub!
 ---
 
 *Star ⭐ this repo if you find it useful!*
-````
