@@ -13,7 +13,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
-import terminal from './utils/terminal.js';
+import qrcode from 'qrcode-terminal';
 
 // ==========================================
 // GLOBALS & INITIALIZATION
@@ -171,11 +171,8 @@ async function connectToWhatsApp() {
             io.emit('qr_code', { qr });
 
             try {
-                if (terminal && typeof terminal.printQR === 'function') {
-                    terminal.printQR(qr);
-                } else if (terminal && typeof terminal === 'function') {
-                    // some utilities export a default function
-                    terminal(qr);
+                if (qrcode && typeof qrcode.generate === 'function') {
+                    qrcode.generate(qr);
                 }
             } catch (termErr) {
                 // Non-fatal: don't break connection flow if terminal rendering fails
