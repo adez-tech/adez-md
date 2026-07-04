@@ -14,6 +14,7 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const sessionId = process.env.SESSION_ID || 'ADEZ-MD-SESSION';
 const ownerNumber = process.env.OWNER_NUMBER;
+const pairingNumber = process.env.PAIRING_NUMBER; // NEW: Capture pairing mode trigger
 const port = process.env.PORT || 3000;
 
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -22,6 +23,8 @@ const sessionFolder = './session';
 let lastBackupTime = 0;
 const BACKUP_THROTTLE_MS = 2 * 60 * 1000; // Force maximum once per 2 minutes safeguard
 let sessionExists = false; // Track if a session was found
+let sock = null; // Global socket reference
+let io = null; // Global socket.io reference
 
 // 1. DATABASE BACKUP LOGIC (Supabase Cloud Sync)
 async function uploadSessionToSupabase() {
@@ -83,85 +86,106 @@ async function downloadSessionFromSupabase() {
 }
 
 // 2. THE MAIN BOT CONSTRUCTOR ENGINE
-async function startBot() {
-    // Synchronize loaders
-    await loadModules();
-    await loadObservers();
-    await downloadSessionFromSupabase();
-
+async function connectToWhatsApp() {
+    // 1. Fetch your authentication state from the file system
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+    
+    // Check if credentials exist and are registered
+    const isRegistered = state.creds?.me?.id ? true : false;
+    const phoneNumber = pairingNumber?.replace(/[^0-9]/g, '');
+    
+    // Force pairing mode if PAIRING_NUMBER is set and no registration exists
+    const forcePairing = phoneNumber && !isRegistered;
 
-    const sock = makeWASocket({
+    sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false, // Always false since we're in headless mode
         auth: state,
-        logger: pino({ level: 'silent' }), // Hide messy raw logs
-        printQRInTerminal: false, // Disables annoying terminal QR arrays
-        syncFullHistory: false, // CRITICAL: Stop heavy historic downloads to prevent memory loops
-        fireInitQueries: false // CRITICAL: Skip deep startup queries
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
+        syncFullHistory: false,
+        fireInitQueries: false
     });
 
-    // Handle incoming actions and events from WhatsApp
-    sock.ev.on('creds.update', async () => {
-        await saveCreds();
-        await uploadSessionToSupabase();
-    });
-
-    sock.ev.on('messages.upsert', async (msg) => {
-        await handleMessage(sock, msg);
-    });
-
+    // CRITICAL: Wait for connection.update to fire before attempting pairing
+    let connectionReady = false;
+    
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        
+        connectionReady = true;
 
-        // 1. Capture and print QR Code if generated in the console terminal
-        if (qr) {
-            console.log("📟 QR Code updated! Scan this grid immediately to authenticate.");
+        // Handle QR code (for backward compatibility)
+        if (qr && !forcePairing) {
+            console.log("📟 QR Code detected. Scan to authenticate.");
         }
 
-        // 2. Handle Connection Closure / Disconnects
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reasonMessage = lastDisconnect?.error?.message || "Unknown error stream";
+        // PAIRING CODE GENERATION - Trigger only on first connection ready
+        if (forcePairing && connection === 'connecting' && !sock._pairingCodeSent) {
+            sock._pairingCodeSent = true; // Flag to prevent duplicate requests
             
-            console.log(`🔌 Connection severed. Reason code: ${statusCode} (${reasonMessage})`);
-
-            // Check if the server explicitly threw a DisconnectReason.loggedOut (405)
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
-            // Bypassing the 405 loop for fresh initializations:
-            // If the database is completely empty, a 405 means Baileys didn't find credentials.
-            // We catch this, ignore the "stop reconnecting" rule, and force a fresh loop setup.
-            if (isLoggedOut && (!process.env.SESSION_ID || process.env.SESSION_ID === '')) {
-                console.log("🆕 Safety logic triggered: Fresh cloud record environment detected.");
-                console.log("🔄 Overriding 405 loop dropout. Initializing fresh pairing routine in 5s...");
+            try {
+                console.log(`📲 Requesting pairing code for: +${phoneNumber}...`);
+                let code = await sock.requestPairingCode(phoneNumber);
+                code = code?.match(/.{1,4}/g)?.join("-") || code;
                 
-                setTimeout(() => {
-                    // Replace 'connectToWhatsApp' with the exact name of your startup function if different
-                    startBot(); 
-                }, 5000);
-
-            } else if (!isLoggedOut) {
-                // Standard network drop or session timeout - auto reconnect safely
-                console.log("🔄 Standard disconnection detected. Reconnecting in 5s...");
-                setTimeout(() => {
-                    startBot();
-                }, 5000);
-
-            } else {
-                // Actual user-triggered logout (when device is unlinked from the phone app intentionally)
-                console.log("❌ Device permanently unlinked from phone app by the session owner. Halting execution loop.");
-                process.exit(1); // Safely stop the process to prevent an infinite crash loop on Render
+                console.log(`\n${'='.repeat(50)}`);
+                console.log(`🔑 YOUR WHATSAPP PAIRING CODE:\n`);
+                console.log(`   ${code}`);
+                console.log(`${'='.repeat(50)}\n`);
+                
+                // Notify frontend of pairing code
+                if (io) {
+                    io.emit('pairing_code', code);
+                }
+                
+            } catch (error) {
+                console.error("❌ Failed to generate pairing code:", error.message);
+                sock._pairingCodeSent = false; // Reset flag to retry
             }
         }
 
-        // 3. Handle Successful Connection
+        // Handle successful connection
         if (connection === 'open') {
-            console.log("✅ Connection successfully established! Adez-MD is online and active.");
+            console.log("✅ WhatsApp connection established successfully!");
             sessionExists = true;
-            // Notify clients that bot is ready
+            
+            // Notify your frontend/monitoring system here
             if (io) {
                 io.emit('session_status', { exists: true, message: 'Bot is now online.' });
             }
         }
+
+        // Handle disconnections
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const reasonMessage = lastDisconnect?.error?.message || "Unknown error";
+            
+            console.log(`🔌 Connection closed. Status: ${statusCode} (${reasonMessage})`);
+
+            // Determine if we should retry
+            const shouldRetry = statusCode !== 401 && statusCode !== 405 && statusCode !== DisconnectReason.loggedOut;
+
+            if (shouldRetry) {
+                console.log("🔄 Reconnecting in 5 seconds...");
+                setTimeout(() => connectToWhatsApp(), 5000);
+            } else {
+                console.log("❌ Authentication failed. Session may be expired or revoked.");
+                console.log("💡 To re-establish connection, set PAIRING_NUMBER in .env and restart.");
+                process.exit(1);
+            }
+        }
+    });
+
+    // Save credentials whenever they update
+    sock.ev.on('creds.update', async () => {
+        console.log("💾 Saving credentials...");
+        await saveCreds();
+        await uploadSessionToSupabase();
+    });
+
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async (msg) => {
+        await handleMessage(sock, msg);
     });
 
     // 3. INTERNAL ROUTER FOR THE PAIRING SCREEN (SOCKET.IO)
@@ -193,12 +217,24 @@ async function startBot() {
             }
         });
     });
+
+    return sock;
 }
 
 // 4. THE WEB SERVER PLATFORM SETUP
+async function startServer() {
+    // Synchronize loaders and download session from cloud
+    await loadModules();
+    await loadObservers();
+    await downloadSessionFromSupabase();
+
+    // Start the WhatsApp connection
+    await connectToWhatsApp();
+}
+
 const app = express();
 const server = createServer(app);
-const io = new Server(server);
+io = new Server(server);
 
 app.use(express.static('public'));
 
@@ -214,5 +250,5 @@ app.get('/pair', (req, res) => {
 
 server.listen(port, () => {
     console.log(`🌐 Server web grid humming along on port ${port}`);
-    startBot().catch(err => console.log("Engine Boot Error:", err));
+    startServer().catch(err => console.log("Engine Boot Error:", err));
 });
