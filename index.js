@@ -1,254 +1,211 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
-import { createClient } from '@supabase/supabase-js';
+import makeWASocket, { 
+    useMultiFileAuthState, 
+    DisconnectReason 
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import pino from 'pino';
+import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
-import path from 'path';
-import AdmZip from 'adm-zip';
-import { loadModules, loadObservers, handleMessage } from './lib/router.js';
 
-// Initialize Config variables from our secure vault (.env)
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
-const sessionId = process.env.SESSION_ID || 'ADEZ-MD-SESSION';
-const ownerNumber = process.env.OWNER_NUMBER;
-const pairingNumber = process.env.PAIRING_NUMBER; // NEW: Capture pairing mode trigger
-const port = process.env.PORT || 3000;
+// ==========================================
+// GLOBALS & INITIALIZATION
+// ==========================================
+const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, { cors: { origin: "*" } });
+const PORT = process.env.PORT || 10000;
 
-const supabase = createClient(supabaseUrl, supabaseKey);
-const sessionFolder = './session';
+let sock = null;
 
-let lastBackupTime = 0;
-const BACKUP_THROTTLE_MS = 2 * 60 * 1000; // Force maximum once per 2 minutes safeguard
-let sessionExists = false; // Track if a session was found
-let sock = null; // Global socket reference
-let io = null; // Global socket.io reference
+const supabase = createClient(
+    process.env.SUPABASE_URL || '', 
+    process.env.SUPABASE_KEY || ''
+);
+const SESSION_ID = 'ADEZ-MD-SESSION';
 
-// 1. DATABASE BACKUP LOGIC (Supabase Cloud Sync)
-async function uploadSessionToSupabase() {
-    const now = Date.now();
-    if (now - lastBackupTime < BACKUP_THROTTLE_MS) return; // Throttle to prevent database rate limits
-    
+// ==========================================
+// DATA UTILITIES
+// ==========================================
+async function syncSessionFiles(cloudData) {
+    if (!cloudData) return;
     try {
-        if (!fs.existsSync(sessionFolder)) return;
-        
-        const zip = new AdmZip();
-        zip.addLocalFolder(sessionFolder);
-        const base64Data = zip.toBuffer().toString('base64');
-
-        // Upsert drops a row if it exists, or creates a brand new one if it doesn't
-        const { error } = await supabase
-            .from('bu_sessions')
-            .upsert({ id: sessionId, data: base64Data });
-
-        if (error) throw error;
-        lastBackupTime = now;
-        console.log('☁️ [Database Sync] Session successfully protected in Supabase Cloud.');
+        if (!fs.existsSync('./session')) fs.mkdirSync('./session');
+        fs.writeFileSync('./session/creds.json', JSON.stringify(cloudData, null, 2));
+        console.log('✅ Local session files completely synchronized.');
     } catch (err) {
-        console.log('❌ [Database Sync Error]:', err.message);
+        console.error('❌ Failed to write credentials file:', err.message);
     }
 }
 
-async function downloadSessionFromSupabase() {
+async function loadSessionFromCloud() {
     try {
         console.log('🔍 Checking Supabase for pre-existing cloud sessions...');
         const { data, error } = await supabase
             .from('bu_sessions')
             .select('data')
-            .eq('id', sessionId)
-            .maybeSingle();
+            .eq('id', SESSION_ID)
+            .single();
 
-        if (error) throw error;
-        if (data && data.data) {
-            console.log('📦 Found matching cloud credentials. Restoring local session states...');
-            sessionExists = true;
-            if (fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
-            fs.mkdirSync(sessionFolder, { recursive: true });
-
-            const zipBuffer = Buffer.from(data.data, 'base64');
-            const zip = new AdmZip(zipBuffer);
-            zip.extractAllTo(sessionFolder, true);
-            console.log('✅ Local session files completely synchronized.');
-        } else {
+        if (error || !data) {
             console.log('🆕 No prior cloud records detected. Fresh credentials required.');
-            sessionExists = false;
-            // Notify connected clients that pairing is required
-            if (io) {
-                io.emit('session_status', { exists: false, message: 'No session found. Please scan the pairing code.' });
-            }
+            return null;
         }
+        return JSON.parse(data.data);
     } catch (err) {
-        console.log('❌ [Session Download Failed]:', err.message);
-        sessionExists = false;
+        return null;
     }
 }
 
-// 2. THE MAIN BOT CONSTRUCTOR ENGINE
+async function saveSessionToCloud() {
+    try {
+        if (!fs.existsSync('./session/creds.json')) return;
+        const localData = fs.readFileSync('./session/creds.json', 'utf-8');
+        
+        const { error } = await supabase
+            .from('bu_sessions')
+            .upsert({ 
+                id: SESSION_ID, 
+                data: localData,
+                updated_at: new Date()
+            });
+
+        if (error) throw error;
+        console.log('☁️ [Database Sync] Session successfully protected in Supabase Cloud.');
+    } catch (err) {
+        console.error('❌ [Database Sync Error]:', err.message);
+    }
+}
+
+// ==========================================
+// CORE WHATSAPP CONNECTION HANDLING
+// ==========================================
 async function connectToWhatsApp() {
-    // 1. Fetch your authentication state from the file system
-    const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-    
-    // Check if credentials exist and are registered
-    const isRegistered = state.creds?.me?.id ? true : false;
-    const phoneNumber = pairingNumber?.replace(/[^0-9]/g, '');
-    
-    // Force pairing mode if PAIRING_NUMBER is set and no registration exists
-    const forcePairing = phoneNumber && !isRegistered;
+    // If local creds don't exist, recover them safely *before* initialization
+    if (!fs.existsSync('./session/creds.json')) {
+        const cloudState = await loadSessionFromCloud();
+        if (cloudState) {
+            await syncSessionFiles(cloudState);
+        }
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState('./session');
 
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // Always false since we're in headless mode
+        printQRInTerminal: !process.env.PAIRING_NUMBER,
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"],
-        syncFullHistory: false,
-        fireInitQueries: false
+        browser: ["Ubuntu", "Chrome", "22.0.0"]
     });
 
-    // CRITICAL: Wait for connection.update to fire before attempting pairing
-    let connectionReady = false;
-    
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        connectionReady = true;
+    sock._pairingCodeSent = false;
+    const isRegistered = !!state.creds?.me?.id;
 
-        // Handle QR code (for backward compatibility)
-        if (qr && !forcePairing) {
-            console.log("📟 QR Code detected. Scan to authenticate.");
+    // Pairing Logic Fix
+    if (process.env.PAIRING_NUMBER && !isRegistered) {
+        if (!sock._pairingCodeSent) {
+            sock._pairingCodeSent = true;
+            const cleanNumber = process.env.PAIRING_NUMBER.replace(/[^0-9]/g, '');
+            console.log(`📲 Requesting pairing code for: +${cleanNumber}...`);
+
+            setTimeout(async () => {
+                try {
+                    let code = await sock.requestPairingCode(cleanNumber);
+                    code = code?.match(/.{1,4}/g)?.join("-") || code;
+                    
+                    console.log(`\n==================================================`);
+                    console.log(`🔑 YOUR WHATSAPP PAIRING CODE:   ${code}`);
+                    console.log(`==================================================\n`);
+
+                    io.emit('pairing_code', { number: cleanNumber, code: code });
+                } catch (pairErr) {
+                    console.error('❌ Failed to generate pairing code:', pairErr.message);
+                    sock._pairingCodeSent = false;
+                }
+            }, 6000); 
         }
+    }
 
-        // PAIRING CODE GENERATION - Trigger only on first connection ready
-        if (forcePairing && connection === 'connecting' && !sock._pairingCodeSent) {
-            sock._pairingCodeSent = true; // Flag to prevent duplicate requests
+    // LISTENER: Incoming Message Command Processor
+    sock.ev.on('messages.upsert', async (chatUpdate) => {
+        try {
+            const msg = chatUpdate.messages[0];
+            if (!msg.message || msg.key.fromMe) return;
+
+            const body = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+            const prefix = process.env.PREFIX || ".";
             
-            try {
-                console.log(`📲 Requesting pairing code for: +${phoneNumber}...`);
-                let code = await sock.requestPairingCode(phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join("-") || code;
-                
-                console.log(`\n${'='.repeat(50)}`);
-                console.log(`🔑 YOUR WHATSAPP PAIRING CODE:\n`);
-                console.log(`   ${code}`);
-                console.log(`${'='.repeat(50)}\n`);
-                
-                // Notify frontend of pairing code
-                if (io) {
-                    io.emit('pairing_code', code);
+            if (body.startsWith(prefix)) {
+                const args = body.slice(prefix.length).trim().split(/ +/);
+                const command = args.shift().toLowerCase();
+                const from = msg.key.remoteJid;
+
+                console.log(`📥 [Command Trigger]: ${command} from ${from}`);
+
+                // Basic Test / Keep-Alive Command Check
+                if (command === 'ping') {
+                    await sock.sendMessage(from, { text: '🤖 Adez-MD online and running smoothly!' }, { quoted: msg });
                 }
                 
-            } catch (error) {
-                console.error("❌ Failed to generate pairing code:", error.message);
-                sock._pairingCodeSent = false; // Reset flag to retry
+                // Route to external command files if your framework uses them here
             }
+        } catch (msgErr) {
+            console.error('❌ Error handling message context:', msgErr);
+        }
+    });
+
+    // Connection Lifecycle
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'connecting') {
+            console.log('🔄 Establishing secure handshakes with WhatsApp network...');
         }
 
-        // Handle successful connection
         if (connection === 'open') {
-            console.log("✅ WhatsApp connection established successfully!");
-            sessionExists = true;
-            
-            // Notify your frontend/monitoring system here
-            if (io) {
-                io.emit('session_status', { exists: true, message: 'Bot is now online.' });
-            }
+            console.log('✅ Connection fully established! Adez-MD is active.');
+            io.emit('bot_status', { state: 'open' });
+            await saveSessionToCloud();
         }
 
-        // Handle disconnections
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reasonMessage = lastDisconnect?.error?.message || "Unknown error";
+            const statusCode = (lastDisconnect?.error instanceof Boom) 
+                ? lastDisconnect.error.output.statusCode 
+                : null;
             
-            console.log(`🔌 Connection closed. Status: ${statusCode} (${reasonMessage})`);
-
-            // Determine if we should retry
-            const shouldRetry = statusCode !== 401 && statusCode !== 405 && statusCode !== DisconnectReason.loggedOut;
-
-            if (shouldRetry) {
-                console.log("🔄 Reconnecting in 5 seconds...");
-                setTimeout(() => connectToWhatsApp(), 5000);
+            console.log(`🔌 Connection closed. Status: ${statusCode}`);
+            
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 405) {
+                console.error('❌ Session terminated. Requires manual setup.');
+                process.exit(1); 
             } else {
-                console.log("❌ Authentication failed. Session may be expired or revoked.");
-                console.log("💡 To re-establish connection, set PAIRING_NUMBER in .env and restart.");
-                process.exit(1);
+                setTimeout(() => connectToWhatsApp(), 5000);
             }
         }
     });
 
-    // Save credentials whenever they update
     sock.ev.on('creds.update', async () => {
-        console.log("💾 Saving credentials...");
         await saveCreds();
-        await uploadSessionToSupabase();
-    });
-
-    // Handle incoming messages
-    sock.ev.on('messages.upsert', async (msg) => {
-        await handleMessage(sock, msg);
-    });
-
-    // 3. INTERNAL ROUTER FOR THE PAIRING SCREEN (SOCKET.IO)
-    io.removeAllListeners('connection');
-    io.on('connection', (socket) => {
-        // Immediately tell the client if a session exists
-        socket.emit('session_check', { exists: sessionExists });
-        
-        // If no session exists, prompt for pairing code
-        if (!sessionExists) {
-            socket.emit('pairing_required', {
-                message: 'No existing session found. Please provide your phone number to generate a pairing code.'
-            });
+        if (fs.existsSync('./session/creds.json')) {
+            await saveSessionToCloud();
         }
+    });
+}
 
-        socket.on('request_code', async (num) => {
-            try {
-                const formattedNum = num.replace(/[^0-9]/g, '');
-                console.log(`📲 Pairing code request initiated for number: ${formattedNum}`);
-                
-                let code = await sock.requestPairingCode(formattedNum);
-                code = code?.match(/.{1,4}/g)?.join('-') || code; // Break it down into readable ABCD-EFGH format
-                
-                console.log(`✅ Pairing code generated: ${code}`);
-                socket.emit('pairing_code', code);
-            } catch (err) {
-                console.log(`❌ Pairing code error: ${err.message}`);
-                socket.emit('pairing_error', 'Failed to retrieve code. Check if the server is already linked.');
-            }
-        });
+// ==========================================
+// APPLICATION SERVER SPIN UP
+// ==========================================
+function startServer() {
+    app.get('/', (req, res) => {
+        res.status(200).json({ status: "online", system: "Adez-MD Grid" });
     });
 
-    return sock;
+    httpServer.listen(PORT, () => {
+        console.log(`🌐 Server web grid humming along on port ${PORT}`);
+        connectToWhatsApp();
+    });
 }
 
-// 4. THE WEB SERVER PLATFORM SETUP
-async function startServer() {
-    // Synchronize loaders and download session from cloud
-    await loadModules();
-    await loadObservers();
-    await downloadSessionFromSupabase();
-
-    // Start the WhatsApp connection
-    await connectToWhatsApp();
-}
-
-const app = express();
-const server = createServer(app);
-io = new Server(server);
-
-app.use(express.static('public'));
-
-// UptimeRobot Health Monitoring Endpoint
-app.get('/', (req, res) => {
-    res.json({ status: "healthy", bot: "ADEZ-MD", node: process.version });
-});
-
-// Route for your custom browser link page
-app.get('/pair', (req, res) => {
-    res.sendFile(path.resolve('./public/pair.html'));
-});
-
-server.listen(port, () => {
-    console.log(`🌐 Server web grid humming along on port ${port}`);
-    startServer().catch(err => console.log("Engine Boot Error:", err));
-});
+startServer();
